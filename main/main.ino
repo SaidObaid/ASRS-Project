@@ -1,12 +1,11 @@
-/***************************************************************
+/****************************************************************
  * File Name: main.ino
  * Author:  Said Obaid, University of New Brunswick
-            Alejandro Guarin, <Your Institution> (ORIGINAL CODE)     
+ *          Alejandro Guarin, <Your Institution> (ORIGINAL CODE)     
  * Date: 21/07/2025
- * File Type: Program
  * Description: General movement program via RFID Card input or 
-   manual serial input.
- ***************************************************************
+ * manual serial input.
+ ****************************************************************
  * Modification History:
  * [2024] - Original File Developed by Alejandro Guarin.
  * [2025] - Said Obaid became continues works.
@@ -19,7 +18,7 @@
  *                motors is not mutually exclusive.
  *              - haltHorizontal & haltVertical added so 
  *                halting motors can be stopped faster 
-*                 following configured halting acceleration.
+ *                following configured halting acceleration.
  *              - Removed generalSensor bool, no functionality
  *                was observed.
  *              - Added serial debugging command 'R' to reset
@@ -69,6 +68,8 @@
 #include <TimerOne.h>
 #include <AccelStepper.h>
 
+#include "state_queue.h"
+
 #define LED_PIN 13
 
 #define SS_PIN 53
@@ -90,6 +91,14 @@
 #define GRIPPER_PIN 32
 #define PISTON_PIN 40
 
+#define STEPS_PER_mm_VERTICAL   66.87584
+#define STEPS_PER_mm_HORIZONTAL -13.5451
+
+#define VERTICALINCREMENT_mm    1.0
+#define HORIZONTALINCREMENT_mm  1.0
+
+#define TIMESTEP 50.0
+
 
 MFRC522 rfid(SS_PIN, RST_PIN);
 
@@ -98,11 +107,14 @@ AccelStepper verticalStepper(1, MOTOR2_STEP, MOTOR2_DIR);
 
 String msgQueued;
 
+unsigned long referenceMillis;
+unsigned long currentMillis;
+
 float horizontalMaxSpeed = 1000;
 float horizontalAcceleration = 300;
-float verticalMaxSpeed = 3000;
+const float verticalMaxSpeed = 3000;
 float verticalAcceleration = 1000;
-float haltAcceleration = 1000;
+const float haltAcceleration = 1000;
 
 float horizontalLimitTestSpeed = 1000;
 float verticalLimitTestSpeed = 2000;
@@ -129,17 +141,13 @@ volatile bool isLeftTriggered = false;
 volatile bool isRightTriggered = false;
 
 volatile bool isMoveComplete = false;
+volatile bool isActionComplete = false;
 volatile bool isPaused = false;
 volatile bool isMoving = false;
 
 bool PistonState = LOW;
 bool GripperState = LOW;
 
-#define STEPS_PER_mm_VERTICAL   66.87584
-#define STEPS_PER_mm_HORIZONTAL -13.5451
-
-#define VERTICALINCREMENT_mm    1
-#define HORIZONTALINCREMENT_mm  1
 
 
 // Define shelf locations and corresponding RFID UIDs
@@ -198,10 +206,24 @@ void setup() {
   delay(1000);
   calibrateLimits();
   Serial.println("\nSystem initialized. Bring an RFID card close...");
+  referenceMillis = millis();
 }
 
 void loop() {
-  //updateSpeed();
+  
+  currentMillis = millis();  
+  if (isMoveComplete){
+    // continue here
+    isActionComplete = true;
+  }
+  if ((currentMillis - referenceMillis >= TIMESTEP) && (queueCount > 0) && isActionComplete){
+    referenceMillis = currentMillis;
+    dequeueState(state);
+    horizontalStepper.setSpeed(state.xVel);
+    verticalStepper.setSpeed(state.yVel);
+    moveJ(state.xCoord,state.yCoord);
+    isActionComplete = false;
+  }
   updatePosition();
 
   if (msgQueued.length() > 0) {
