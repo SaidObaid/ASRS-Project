@@ -38,6 +38,8 @@
  * [01-08-2025] - Restructured how movement is handle to avoid 
  *                blocking code.
  *              - Added on-the-go serial motor pause/resume.
+ * [02-08-2025] - Began process of integrating a queue system to
+ *                facilitate trajectory/command planning.
  ****************************************************************
  * License: MIT License
  * 
@@ -109,6 +111,8 @@ String msgQueued;
 
 unsigned long referenceMillis;
 unsigned long currentMillis;
+
+StateCommand state;
 
 float horizontalMaxSpeed = 1000;
 float horizontalAcceleration = 300;
@@ -369,7 +373,7 @@ String getUIDString() {
 }
 
 void goToOrigin(){
-  moveJ(0, 121.875);
+  moveJ(255,450);
 }
 
 void calibrateLimits(){
