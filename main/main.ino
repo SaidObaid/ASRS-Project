@@ -69,8 +69,11 @@
 #include <MFRC522.h>
 #include <TimerOne.h>
 #include <AccelStepper.h>
+#include <avr/pgmspace.h>
 
 #include "state_queue.h"
+#include "trajectory.h"
+
 
 #define LED_PIN 13
 
@@ -99,7 +102,7 @@
 #define VERTICALINCREMENT_mm    1.0
 #define HORIZONTALINCREMENT_mm  1.0
 
-#define TIMESTEP 50.0
+
 
 
 MFRC522 rfid(SS_PIN, RST_PIN);
@@ -107,16 +110,18 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 AccelStepper horizontalStepper(1, MOTOR1_STEP, MOTOR1_DIR);
 AccelStepper verticalStepper(1, MOTOR2_STEP, MOTOR2_DIR);
 
+
 String msgQueued;
 
 unsigned long referenceMillis;
 unsigned long currentMillis;
+unsigned long timeStep = 100;
 
 StateCommand state;
 
-float horizontalMaxSpeed = 1000;
+float horizontalMaxSpeed = 100000;
 float horizontalAcceleration = 300;
-const float verticalMaxSpeed = 3000;
+const float verticalMaxSpeed = 300000;
 float verticalAcceleration = 1000;
 const float haltAcceleration = 1000;
 
@@ -148,6 +153,7 @@ volatile bool isMoveComplete = false;
 volatile bool isActionComplete = false;
 volatile bool isPaused = false;
 volatile bool isMoving = false;
+volatile bool lastAction = false;
 
 bool PistonState = LOW;
 bool GripperState = LOW;
@@ -188,15 +194,18 @@ void setup() {
   Serial.begin(9600);
   SPI.begin();
   rfid.PCD_Init();
+  clearStateQueue();
 
   pinMode(PROX_SENSOR_UP, INPUT);
   pinMode(PROX_SENSOR_DOWN, INPUT);
   pinMode(PROX_SENSOR_LEFT, INPUT);
   pinMode(PROX_SENSOR_RIGHT, INPUT);
 
+  horizontalStepper.setSpeed(horizontalLimitTestSpeed);
   horizontalStepper.setMaxSpeed(horizontalMaxSpeed);
   horizontalStepper.setAcceleration(horizontalAcceleration);
 
+  verticalStepper.setSpeed(verticalLimitTestSpeed);
   verticalStepper.setMaxSpeed(verticalMaxSpeed);
   verticalStepper.setAcceleration(verticalAcceleration);
   
@@ -208,26 +217,14 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PROX_SENSOR_LEFT), sensorLeft_ISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(PROX_SENSOR_RIGHT), sensorRight_ISR, FALLING);
   delay(1000);
-  calibrateLimits();
+  //calibrateLimits();
   Serial.println("\nSystem initialized. Bring an RFID card close...");
   referenceMillis = millis();
 }
 
 void loop() {
-  
   currentMillis = millis();  
-  if (isMoveComplete){
-    // continue here
-    isActionComplete = true;
-  }
-  if ((currentMillis - referenceMillis >= TIMESTEP) && (queueCount > 0) && isActionComplete){
-    referenceMillis = currentMillis;
-    dequeueState(state);
-    horizontalStepper.setSpeed(state.xVel);
-    verticalStepper.setSpeed(state.yVel);
-    moveJ(state.xCoord,state.yCoord);
-    isActionComplete = false;
-  }
+
   updatePosition();
 
   if (msgQueued.length() > 0) {
@@ -266,6 +263,7 @@ void loop() {
         case 'O': goToOrigin(); break;
         case 'T': operateGripperAndPiston(1); break;
         case 'F': operateGripperAndPiston(2); break;
+        case 'Q': enqueueTrajectory(); break;
         case 'R': sensorReset(); break;
         default : Serial.println("Unknown Command"); break;
       }
@@ -311,6 +309,7 @@ void loop() {
   
 }
 
+
 void moveJ(long xPos, long yPos) {
   isMoveComplete = false;
   
@@ -349,11 +348,38 @@ void pauseMotors(){
 void updatePosition(){
   isMoving = isMovementAllowed();
 
-  if ((!isMoveComplete) & (!isPaused)) {
-    while (isMoving){
-      horizontalStepper.run();
-      verticalStepper.run();
+  if ((!isMoveComplete || (stateQueueSize() > 0)) & (!isPaused)) {
+    while (isMoving || (stateQueueSize() > 0)){
+      currentMillis = millis();
+      if (stateQueueSize() > 0){
+        if(currentMillis - referenceMillis >= timeStep){
+          dequeueState(state);
+          timeStep = state.stepDuration;
+          moveJ(state.xCoord,state.yCoord);
+          stateCurrentPosition();
+          //Serial.println(currentMillis - referenceMillis);
+          referenceMillis = currentMillis;
+          if (stateQueueSize() == 0){
+            lastAction = true;
+          }
+        }
+        horizontalStepper.setSpeed(state.xVel*STEPS_PER_mm_HORIZONTAL);
+        verticalStepper.setSpeed(state.yVel*STEPS_PER_mm_VERTICAL); //
+        horizontalStepper.runSpeedToPosition();
+        verticalStepper.runSpeedToPosition();
+      }
+      else{
+        horizontalStepper.run();
+        verticalStepper.run();
+      }
       isMoving = isMovementAllowed();
+    }
+
+    if (lastAction){
+      moveJ(state.xCoord,state.yCoord);
+      horizontalStepper.setSpeed(horizontalLimitTestSpeed);
+      verticalStepper.setSpeed(verticalLimitTestSpeed);
+      lastAction = false;
     }
 
     if (!isPaused){
@@ -384,7 +410,6 @@ void calibrateLimits(){
   }
   sensorReset();
   verticalStepper.setCurrentPosition(0);
-
   while(!isLeftTriggered){
     horizontalStepper.setSpeed(horizontalLimitTestSpeed);
     horizontalStepper.runSpeed();
@@ -429,6 +454,16 @@ void operateGripperAndPiston(int action){
     delay(700);
     digitalWrite(PISTON_PIN, LOW);
     delay(1000);
+  }
+}
+
+void enqueueTrajectory(){
+  TrajectoryPoint tp;
+  for (size_t i = 0; i < trajectoryLen; i++) {
+    memcpy_P(&tp, &trajectoryData[i], sizeof(tp));
+    enqueueState(tp.step_ms, tp.x_mm, tp.y_mm,
+                 tp.vx_mmps, tp.vy_mmps,
+                 (Side)tp.sideSelect, tp.gripperState, tp.pistonState);
   }
 }
 

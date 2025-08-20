@@ -2,10 +2,11 @@
  * File Name: state_queue.cpp
  * Author:  Said Obaid, University of New Brunswick
  * Date: 01/08/2025
- * Description: -
+ * Description: Pointer-based, dynamically sized StateCommand queue
  ****************************************************************
  * Modification History:
  * [01-08-2025] - Original File Developed by Said Obaid.
+ * [18-08-2025] - Converted to linked-list queue (no max size).
  * 
  ****************************************************************
  * License: MIT License as main.ino
@@ -16,31 +17,80 @@
 #include "state_queue.h"
 #include <Arduino.h>
 
-StateCommand stateQueue[STATE_QUEUE_SIZE];
-int queueHead = 0;
-int queueTail = 0;
-int queueCount = 0;
+// Internal node for the linked-list queue
+struct StateNode {
+  StateCommand cmd;
+  StateNode* next;
+};
 
-bool enqueueState(long xCoord, long yCoord, long xVel, long yVel, Side sideSelect, bool gripperState, bool pistonState) {
-  if (queueCount >= STATE_QUEUE_SIZE) {
-    Serial.println("Queue full. Command ignored.");
+// Queue state (head = front/dequeue, tail = back/enqueue)
+static StateNode* headNode = nullptr;
+static StateNode* tailNode = nullptr;
+static long     queueCount = 0;
+
+bool enqueueState(long stepDuration, long xCoord, long yCoord, float xVel,float yVel, 
+                  Side sideSelect, bool gripperState, bool pistonState) {
+  // Prepare the command
+  StateCommand sc = { stepDuration, xCoord, yCoord, xVel, yVel, sideSelect, gripperState, pistonState };
+
+  // Allocate a new node
+  StateNode* node = new StateNode;
+  if (!node) {
+    Serial.println("Queue alloc failed. Command ignored.");
     return false;
   }
-  stateQueue[queueTail] = {xCoord, yCoord, xVel, yVel, sideSelect, gripperState, pistonState};
-  queueTail = (queueTail + 1);
+  node->cmd = sc;
+  node->next = nullptr;
+
+  // Link into list
+  if (!tailNode) {
+    // Empty queue case
+    headNode = tailNode = node;
+  } else {
+    tailNode->next = node;
+    tailNode = node;
+  }
+
   queueCount++;
   return true;
 }
 
 bool dequeueState(StateCommand &state) {
-  if (queueCount == 0) return false;
-  state = stateQueue[queueHead];
-  queueHead = (queueHead + 1) % STATE_QUEUE_SIZE;
+  if (!headNode) {
+    return false; // empty
+  }
+
+  // Pop from front
+  StateNode* node = headNode;
+  state = node->cmd;
+  headNode = node->next;
+
+  if (!headNode) {
+    // Became empty
+    tailNode = nullptr;
+  }
+
+  delete node;
   queueCount--;
   return true;
 }
 
 void clearStateQueue() {
-  queueHead = queueTail = queueCount = 0;
+  // Free all nodes
+  while (headNode) {
+    StateNode* next = headNode->next;
+    delete headNode;
+    headNode = next;
+  }
+  tailNode = nullptr;
+  queueCount = 0;
   Serial.println("State queue cleared.");
+}
+
+long stateQueueSize() {
+  return queueCount;
+}
+
+bool isStateQueueEmpty() {
+  return (queueCount == 0);
 }
