@@ -77,7 +77,7 @@
 
 #define LED_PIN 13
 
-#define SS_PIN 53
+#define SS_PIN 43
 #define RST_PIN 44
 
 #define PROX_SENSOR_UP 19 // Right and Up pin numbers switch around 
@@ -110,53 +110,59 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 AccelStepper horizontalStepper(1, MOTOR1_STEP, MOTOR1_DIR);
 AccelStepper verticalStepper(1, MOTOR2_STEP, MOTOR2_DIR);
 
-
 String msgQueued;
 
-unsigned long referenceMillis;
-unsigned long currentMillis;
-unsigned long timeStep = 100;
+unsigned long referenceMillis, currentMillis, delayTimer;
+unsigned long timeStep = 100, delayActionLength = 2000; //milliseconds
 
-StateCommand state;
+StateQueue trajQueue;
+StateQueue actionQueue;
 
-float horizontalMaxSpeed = 100000;
-float horizontalAcceleration = 300;
-const float verticalMaxSpeed = 300000;
-float verticalAcceleration = 1000;
-const float haltAcceleration = 1000;
-
-float horizontalLimitTestSpeed = 1000;
-float verticalLimitTestSpeed = 2000;
-
-long xLowerLimit = 0;
-long xUpperLimit = 1500;
-long yLowerLimit = 0;
-long yUpperLimit = 900;
+StateCommand trajState, actionState, peekingState;
 
 
-long yPos = 0;
-long xPos = 0;
+float horizontalMaxSpeed = 1200,
+      horizontalAcceleration = 3000,
+      verticalMaxSpeed = 1200,
+      verticalAcceleration = horizontalAcceleration*5,
+      haltAcceleration = 1000,
+      horizontalLimitTestSpeed = 1000,
+      verticalLimitTestSpeed = 2000;
 
-long yPosTemp = 0;
-long xPosTemp = 0;
+long xLowerLimit = 0,
+     xUpperLimit = 1520,
+     yLowerLimit = 0,
+     yUpperLimit = 900;
 
-long yPosCurrent = 0;
-long xPosCurrent = 0;
+
+long yPos = 0,
+     xPos = 0,
+     yPosTemp = 0,
+     xPosTemp = 0,
+     yPosCurrent = 0,
+     xPosCurrent = 0;
+
+long moveMultiplier = 0;
 
 
-volatile bool isUpTriggered = false;
-volatile bool isDownTriggered = false;
-volatile bool isLeftTriggered = false;
-volatile bool isRightTriggered = false;
+volatile bool isUpTriggered, isDownTriggered, isLeftTriggered, isRightTriggered = false;
 
-volatile bool isMoveComplete = false;
-volatile bool isActionComplete = false;
-volatile bool isPaused = false;
-volatile bool isMoving = false;
-volatile bool lastAction = false;
+volatile bool isMoveComplete = false,
+              isActionComplete = false,
+              motorsPaused = false,
+              movementAllowed = false,
+              changeToZero = false,
+              playingQueue = false,
+              delayAction = false;
 
-bool PistonState = LOW;
-bool GripperState = LOW;
+bool piston1State = LOW, 
+     gripper1State = LOW,
+     piston1CurrentState = LOW, 
+     gripper1CurrentState = LOW,
+     piston2State = LOW, 
+     gripper2State = LOW,
+     piston2CurrentState = LOW, 
+     gripper2CurrentState = LOW;
 
 
 
@@ -194,7 +200,8 @@ void setup() {
   Serial.begin(9600);
   SPI.begin();
   rfid.PCD_Init();
-  clearStateQueue();
+  initQueue(trajQueue);
+  initQueue(actionQueue);
 
   pinMode(PROX_SENSOR_UP, INPUT);
   pinMode(PROX_SENSOR_DOWN, INPUT);
@@ -225,7 +232,7 @@ void setup() {
 void loop() {
   currentMillis = millis();  
 
-  updatePosition();
+  updateActions();
 
   if (msgQueued.length() > 0) {
     Serial.print(msgQueued);
@@ -250,23 +257,69 @@ void loop() {
     }
     else if (input.length() >= 1) {
       char command = input.charAt(0);
-      long moveMultiplier = parseCommandValue(input);
-      switch (toupper(command)) {
-        case 'P': digitalWrite(PISTON_PIN, PistonState = !PistonState); break;
-        case 'G': digitalWrite(GRIPPER_PIN, GripperState = !GripperState); break;
-        case 'D': moveJ(xPosCurrent - HORIZONTALINCREMENT_mm * moveMultiplier, yPosCurrent); break;
-        case 'A': moveJ(xPosCurrent + HORIZONTALINCREMENT_mm * moveMultiplier, yPosCurrent); break;
-        case 'S': moveJ(xPosCurrent, yPosCurrent - VERTICALINCREMENT_mm * moveMultiplier); break;
-        case 'W': moveJ(xPosCurrent, yPosCurrent + VERTICALINCREMENT_mm * moveMultiplier); break;
-        case 'B': pauseMotors(); break;
-        case 'H': calibrateLimits(); break;
-        case 'O': goToOrigin(); break;
-        case 'T': operateGripperAndPiston(1); break;
-        case 'F': operateGripperAndPiston(2); break;
-        case 'Q': enqueueTrajectory(); break;
-        case 'R': sensorReset(); break;
-        default : Serial.println("Unknown Command"); break;
+      char directCommand = input.charAt(1);
+      
+      if (command == '/'){
+        input.remove(0,1);
+        moveMultiplier = parseCommandValue(input);
+        switch (toupper(directCommand)) {
+          case 'P': digitalWrite(PISTON_PIN, piston1State = !piston1State); break;
+          case 'G': digitalWrite(GRIPPER_PIN, gripper1State = !gripper1State); break;
+          case 'D': moveJ(xPosCurrent - HORIZONTALINCREMENT_mm * moveMultiplier, yPosCurrent); break;
+          case 'A': moveJ(xPosCurrent + HORIZONTALINCREMENT_mm * moveMultiplier, yPosCurrent); break;
+          case 'S': moveJ(xPosCurrent, yPosCurrent - VERTICALINCREMENT_mm * moveMultiplier); break;
+          case 'W': moveJ(xPosCurrent, yPosCurrent + VERTICALINCREMENT_mm * moveMultiplier); break;
+          case 'B': pauseMotors(); break;
+          case 'H': calibrateLimits(); break;
+          case 'O': goToOrigin(); break;
+          case 'T': operateGripperAndPiston(1); break;
+          case 'F': operateGripperAndPiston(2); break;
+          case 'Q': enqueueTrajectory(); break;
+          case 'R': sensorReset(); break;
+          default : Serial.println("Unknown Command"); break;
+        } 
+
       }
+      else {
+        moveMultiplier = parseCommandValue(input);
+        switch (toupper(command)) {
+          case 'P': piston1CurrentState = piston1State;
+                    piston1State = !piston1State;
+                    enqueueAction(xPosCurrent, yPosCurrent,
+                                  gripper1State, piston1State, gripper2State, piston2State);
+                                  break;
+          case 'G': gripper1State = !gripper1State;
+                    enqueueAction(xPosCurrent, yPosCurrent,
+                                  gripper1State, piston1State, gripper2State, piston2State);
+                                  break;
+          case 'D': enqueueAction(xPosCurrent - HORIZONTALINCREMENT_mm * moveMultiplier,
+                                  yPosCurrent, gripper1State, piston1State,
+                                  gripper2State, piston2State);
+                                  break;
+          case 'A': enqueueAction(xPosCurrent + HORIZONTALINCREMENT_mm * moveMultiplier,
+                                  yPosCurrent, gripper1State, piston1State,
+                                  gripper2State, piston2State);
+                                  break;
+          case 'S': enqueueAction(xPosCurrent, yPosCurrent - VERTICALINCREMENT_mm * moveMultiplier,
+                                  gripper1State, piston1State,
+                                  gripper2State, piston2State);
+                                  break;
+          case 'W': piston1CurrentState = piston1State;
+                    enqueueAction(xPosCurrent, yPosCurrent + VERTICALINCREMENT_mm * moveMultiplier,
+                                  gripper1State, piston1State,
+                                  gripper2State, piston2State);
+                                  break;
+          case 'B': pauseMotors(); break;
+          case 'H': calibrateLimits(); break;
+          case 'O': goToOrigin(); break;
+          case 'T': operateGripperAndPiston(1); break;
+          case 'F': operateGripperAndPiston(2); break;
+          case 'Q': enqueueTrajectory(); break;
+          case 'R': sensorReset(); break;
+          default : Serial.println("Unknown Command"); break;
+        }
+      }
+      
     }
       
   }
@@ -299,16 +352,8 @@ void loop() {
     xPosCurrent = haltHorizontal(haltAcceleration);
     horizontalStepper.setCurrentPosition(xPosCurrent*STEPS_PER_mm_HORIZONTAL);
   }
-
-  if (isMoveComplete 
-      && (xPosCurrent*STEPS_PER_mm_HORIZONTAL != horizontalStepper.currentPosition()
-      || yPosCurrent*STEPS_PER_mm_VERTICAL != verticalStepper.currentPosition())) {
-    horizontalStepper.setCurrentPosition(xPosCurrent*STEPS_PER_mm_HORIZONTAL);
-    verticalStepper.setCurrentPosition(yPosCurrent*STEPS_PER_mm_VERTICAL);
-  }
   
 }
-
 
 void moveJ(long xPos, long yPos) {
   isMoveComplete = false;
@@ -321,17 +366,20 @@ void moveJ(long xPos, long yPos) {
     horizontalStepper.moveTo(xPos * STEPS_PER_mm_HORIZONTAL);
     xPosCurrent = xPos;
   }
+  else{Serial.println("A Horizontal Sensor Was Triggered");}
+
   if (!(isUpTriggered || isDownTriggered)){
     verticalStepper.moveTo(yPos * STEPS_PER_mm_VERTICAL);
     yPosCurrent = yPos;
   }
-  
+  else{Serial.println("A Vertical Sensors Was Triggered");}
+
 }
 
 void pauseMotors(){
-  isPaused = !isPaused;
+  motorsPaused = !motorsPaused;
 
-  if (isPaused) {
+  if (motorsPaused) {
     Serial.println("Motors PAUSED");
     xPosTemp = xPosCurrent;
     yPosTemp = yPosCurrent;
@@ -345,45 +393,75 @@ void pauseMotors(){
   }
 }
 
-void updatePosition(){
-  isMoving = isMovementAllowed();
+void updateActions(){
+  movementAllowed = isMovementAllowed();
 
-  if ((!isMoveComplete || (stateQueueSize() > 0)) & (!isPaused)) {
-    while (isMoving || (stateQueueSize() > 0)){
+  if (delayAction && (millis() - delayTimer >= delayActionLength)){
+    delayAction = false;
+  }
+
+  if ((stateQueueSize(actionQueue) != 0 ) && (!delayAction && isDistanceToPosZero())){
+    if (isDistanceToPosZero()){ // I FIX THIS YESTERDAY
+      dequeueState(actionQueue, actionState);
+      Serial.println("Dequeued Action");
+      moveJ(actionState.xCoord, actionState.yCoord);
+      if (actionState.gripper1State != gripper1CurrentState || actionState.piston1State != piston1CurrentState){
+        digitalWrite(GRIPPER_PIN, actionState.gripper1State);
+        digitalWrite(PISTON_PIN, actionState.piston1State);
+        delayTimer = millis();
+      }
+    }
+  }
+
+  if ((!isDistanceToPosZero() || (stateQueueSize(trajQueue) > 0) ) && (!motorsPaused)) {
+    while (movementAllowed || (stateQueueSize(trajQueue) > 0) || playingQueue){
       currentMillis = millis();
-      if (stateQueueSize() > 0){
+      if (playingQueue && (stateQueueSize(trajQueue) == 0)){
         if(currentMillis - referenceMillis >= timeStep){
-          dequeueState(state);
-          timeStep = state.stepDuration;
-          moveJ(state.xCoord,state.yCoord);
-          stateCurrentPosition();
-          //Serial.println(currentMillis - referenceMillis);
+          playingQueue = false;
+          horizontalStepper.setSpeed(horizontalLimitTestSpeed);
+          verticalStepper.setSpeed(verticalLimitTestSpeed);
+          horizontalStepper.setMaxSpeed(horizontalMaxSpeed);
+          verticalStepper.setMaxSpeed(verticalMaxSpeed);
           referenceMillis = currentMillis;
-          if (stateQueueSize() == 0){
-            lastAction = true;
-          }
         }
-        horizontalStepper.setSpeed(state.xVel*STEPS_PER_mm_HORIZONTAL);
-        verticalStepper.setSpeed(state.yVel*STEPS_PER_mm_VERTICAL); //
-        horizontalStepper.runSpeedToPosition();
-        verticalStepper.runSpeedToPosition();
+      }
+
+      if (stateQueueSize(trajQueue) > 0){
+        playingQueue = true;
+        horizontalStepper.setMaxSpeed(1000);
+        verticalStepper.setMaxSpeed(1000);
+        if(currentMillis - referenceMillis >= timeStep){
+          dequeueState(trajQueue, trajState);
+          moveJ(trajState.xCoord, trajState.yCoord);
+          
+          timeStep = trajState.stepDuration;
+          referenceMillis = currentMillis;
+        }
+        while (currentMillis - referenceMillis < timeStep) {
+          horizontalStepper.setSpeed(trajState.xVel*STEPS_PER_mm_HORIZONTAL);
+          verticalStepper.setSpeed(trajState.yVel*STEPS_PER_mm_VERTICAL); //
+          horizontalStepper.runSpeedToPosition();
+          verticalStepper.runSpeedToPosition();
+          currentMillis = millis();
+        }
       }
       else{
         horizontalStepper.run();
         verticalStepper.run();
+        movementAllowed = isMovementAllowed() && !isDistanceToPosZero();
       }
-      isMoving = isMovementAllowed();
     }
 
-    if (lastAction){
-      moveJ(state.xCoord,state.yCoord);
-      horizontalStepper.setSpeed(horizontalLimitTestSpeed);
-      verticalStepper.setSpeed(verticalLimitTestSpeed);
-      lastAction = false;
+    if (changeToZero && !movementAllowed) {
+      verticalStepper.setCurrentPosition(0);
+      yPosCurrent = 0;
+      horizontalStepper.setCurrentPosition(0);
+      xPosCurrent = 0;
+      changeToZero = false;
     }
 
-    if (!isPaused){
-      isMoveComplete = true;
+    if (!motorsPaused && isDistanceToPosZero()){
       Serial.println("Move Complete");
       stateCurrentPosition();
     }
@@ -399,27 +477,38 @@ String getUIDString() {
 }
 
 void goToOrigin(){
-  moveJ(255,450);
+  moveJ(215,460);
+}
+
+void syncVerticalStepperToState(){
+  verticalStepper.setCurrentPosition(yPosCurrent*STEPS_PER_mm_VERTICAL);
+}
+
+void syncHorizontalStepperToState(){
+  horizontalStepper.setCurrentPosition(xPosCurrent*STEPS_PER_mm_HORIZONTAL);
 }
 
 void calibrateLimits(){
   Serial.println("CALIBRATION IN PROGRESS");
-  while(!isDownTriggered){
-    verticalStepper.setSpeed(-verticalLimitTestSpeed);
-    verticalStepper.runSpeed();
+  while (!isDownTriggered || !isLeftTriggered) {
+    if(!isDownTriggered){
+      verticalStepper.setSpeed(-verticalLimitTestSpeed);
+      verticalStepper.runSpeed();
+    }
+    
+    if(!isLeftTriggered){
+      horizontalStepper.setSpeed(horizontalLimitTestSpeed);
+      horizontalStepper.runSpeed();
+    }
   }
-  sensorReset();
+  
   verticalStepper.setCurrentPosition(0);
-  while(!isLeftTriggered){
-    horizontalStepper.setSpeed(horizontalLimitTestSpeed);
-    horizontalStepper.runSpeed();
-  }
-  sensorReset();
   horizontalStepper.setCurrentPosition(0);
+  sensorReset();
+
   delay(1000);
   moveJ(5,5);
-  xPosCurrent = 0;
-  yPosCurrent = 0;
+  changeToZero = true;
   
   msgQueued = "CALIBRATION COMPLETE\n";
 }
@@ -461,11 +550,22 @@ void enqueueTrajectory(){
   TrajectoryPoint tp;
   for (size_t i = 0; i < trajectoryLen; i++) {
     memcpy_P(&tp, &trajectoryData[i], sizeof(tp));
-    enqueueState(tp.step_ms, tp.x_mm, tp.y_mm,
+    enqueueState(trajQueue, tp.step_ms, tp.x_mm, tp.y_mm,
                  tp.vx_mmps, tp.vy_mmps,
-                 (Side)tp.sideSelect, tp.gripperState, tp.pistonState);
+                 tp.gripper1State, tp.piston1State,
+                 tp.gripper2State, tp.piston2State);
   }
 }
+
+void enqueueAction(long xPosCMD, long yPosCMD, bool gripper1CMD, bool piston1CMD, bool gripper2CMD, bool piston2CMD){
+  xPosCMD = constrain(xPosCMD, xLowerLimit, xUpperLimit);
+  yPosCMD = constrain(yPosCMD, yLowerLimit, yUpperLimit);
+  Serial.println(String(piston1CMD));
+  enqueueState(actionQueue, -1, xPosCMD, yPosCMD, -1, -1,
+              gripper1CMD, piston1CMD, gripper2CMD, piston2CMD);
+  Serial.println("Enqueued Postion: X: " + String(xPosCMD) + ", Y: " + String(yPosCMD));
+}
+
 
 void blinkingLed() {
   static bool ledState = LOW; // Estado del LED (LOW = apagado, HIGH = encendido)
@@ -503,8 +603,11 @@ long parseCommandValue(const String& input) {
 }
 
 bool isMovementAllowed(){
-  return (horizontalStepper.distanceToGo() != 0 || verticalStepper.distanceToGo() != 0) 
-              && (Serial.available() <= 0)
-              && (!(isUpTriggered || isDownTriggered))
-              && (!(isRightTriggered || isLeftTriggered));
+  return((Serial.available() <= 0)
+         && (!(isUpTriggered || isDownTriggered))
+         && (!(isRightTriggered || isLeftTriggered)));
+}
+
+bool isDistanceToPosZero(){
+  return (horizontalStepper.distanceToGo() == 0 && verticalStepper.distanceToGo() == 0);
 }

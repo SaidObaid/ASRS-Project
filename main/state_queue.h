@@ -17,32 +17,55 @@
 #ifndef STATE_QUEUE_H
 #define STATE_QUEUE_H
 
-enum Side {
-  Right = 0,
-  Left  = 1
-};
+#include <Arduino.h>
 
 struct StateCommand {
   long  stepDuration;
   long  xCoord;
   long  yCoord;
-  float xVel;         // NOTE: velocities are float in the command struct
+  float xVel;
   float yVel;
-  Side  sideSelect;
-  bool  gripperState;
-  bool  pistonState;
+  bool  gripper1State;
+  bool  piston1State;
+  bool  gripper2State;
+  bool  piston2State;
 };
 
-// Queue (internals are hidden in state_queue.cpp)
-bool enqueueState(long stepDuration, long xCoord, long yCoord,
+// Forward-declare internal node type
+struct StateNode;
+
+// Instance-based queue (supports many queues at once)
+struct StateQueue {
+  StateNode* head;
+  StateNode* tail;
+  long       count;
+};
+
+// API
+void initQueue(StateQueue &q);
+
+// Enqueue using a ready command
+bool enqueueState(StateQueue &q, const StateCommand &sc);
+
+// Enqueue using fields (convenience overload)
+bool enqueueState(StateQueue &q,
+                  long stepDuration, long xCoord, long yCoord,
                   float xVel, float yVel,
-                  Side sideSelect, bool gripperState, bool pistonState);
+                  bool gripper1State, bool piston1State,
+                  bool gripper2State, bool piston2State);
 
-bool dequeueState(StateCommand &cmd);
+// Dequeue front element into out. Returns false if empty.
+bool dequeueState(StateQueue &q, StateCommand &out);
 
-void clearStateQueue();
+// Peek front element into out (without removing). Returns false if empty.
+bool peekState(const StateQueue &q, StateCommand &out);
 
-long stateQueueSize();
-bool isStateQueueEmpty();
+// Remove all nodes and reset
+void clearStateQueue(StateQueue &q);
+
+//  Helpers
+long stateQueueSize(const StateQueue &q);
+bool isStateQueueEmpty(const StateQueue &q);
 
 #endif // STATE_QUEUE_H
+

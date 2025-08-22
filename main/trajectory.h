@@ -19,13 +19,14 @@
 
 struct TrajectoryPoint {
   long    step_ms;   
-  long    x_mm;      
-  long    y_mm;      
+  float   x_mm;      
+  float   y_mm;      
   float   vx_mmps;   
-  float   vy_mmps;   
-  bool    sideSelect;        
-  bool    gripperState;        
-  bool    pistonState;        
+  float   vy_mmps;          
+  bool    gripper1State;        
+  bool    piston1State;;          
+  bool    gripper2State;        
+  bool    piston2State;         
 };
 
 extern const TrajectoryPoint trajectoryData[][8];

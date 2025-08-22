@@ -15,82 +15,85 @@
  * Copyright 2025. Said Obaid, University of New Brunswick
  ****************************************************************/
 #include "state_queue.h"
-#include <Arduino.h>
 
 // Internal node for the linked-list queue
 struct StateNode {
   StateCommand cmd;
-  StateNode* next;
+  StateNode*   next;
 };
 
-// Queue state (head = front/dequeue, tail = back/enqueue)
-static StateNode* headNode = nullptr;
-static StateNode* tailNode = nullptr;
-static long     queueCount = 0;
+void initQueue(StateQueue &q) {
+  q.head  = nullptr;
+  q.tail  = nullptr;
+  q.count = 0;
+}
 
-bool enqueueState(long stepDuration, long xCoord, long yCoord, float xVel,float yVel, 
-                  Side sideSelect, bool gripperState, bool pistonState) {
-  // Prepare the command
-  StateCommand sc = { stepDuration, xCoord, yCoord, xVel, yVel, sideSelect, gripperState, pistonState };
-
-  // Allocate a new node
+bool enqueueState(StateQueue &q, const StateCommand &sc) {
   StateNode* node = new StateNode;
   if (!node) {
-    Serial.println("Queue alloc failed. Command ignored.");
+    Serial.println(F("Queue alloc failed. Command ignored."));
     return false;
   }
-  node->cmd = sc;
+  node->cmd  = sc;
   node->next = nullptr;
 
-  // Link into list
-  if (!tailNode) {
-    // Empty queue case
-    headNode = tailNode = node;
+  if (!q.tail) {
+    // empty queue
+    q.head = q.tail = node;
   } else {
-    tailNode->next = node;
-    tailNode = node;
+    q.tail->next = node;
+    q.tail       = node;
   }
-
-  queueCount++;
+  q.count++;
   return true;
 }
 
-bool dequeueState(StateCommand &state) {
-  if (!headNode) {
-    return false; // empty
-  }
+bool enqueueState(StateQueue &q,
+                  long stepDuration, long xCoord, long yCoord,
+                  float xVel, float yVel,
+                  bool gripper1State, bool piston1State,
+                  bool gripper2State, bool piston2State)
+{
+  StateCommand sc{ stepDuration, xCoord, yCoord, xVel, yVel,
+                   gripper1State, piston1State,
+                   gripper2State, piston2State};
+  return enqueueState(q, sc);
+}
 
-  // Pop from front
-  StateNode* node = headNode;
-  state = node->cmd;
-  headNode = node->next;
+bool dequeueState(StateQueue &q, StateCommand &out) {
+  if (!q.head) return false;
 
-  if (!headNode) {
-    // Became empty
-    tailNode = nullptr;
-  }
+  StateNode* node = q.head;
+  out   = node->cmd;
+  q.head = node->next;
+  if (!q.head) q.tail = nullptr;  // became empty
 
   delete node;
-  queueCount--;
+  q.count--;
   return true;
 }
 
-void clearStateQueue() {
-  // Free all nodes
-  while (headNode) {
-    StateNode* next = headNode->next;
-    delete headNode;
-    headNode = next;
+bool peekState(const StateQueue &q, StateCommand &out) {
+  if (!q.head) return false;
+  out = q.head->cmd;   // **no modification** to the queue
+  return true;
+}
+
+void clearStateQueue(StateQueue &q) {
+  while (q.head) {
+    StateNode* next = q.head->next;
+    delete q.head;
+    q.head = next;
   }
-  tailNode = nullptr;
-  queueCount = 0;
-  Serial.println("State queue cleared.");
+  q.tail  = nullptr;
+  q.count = 0;
+  Serial.println(F("State queue cleared."));
 }
 
-long stateQueueSize() {
-  return queueCount;
+long stateQueueSize(const StateQueue &q) {
+  return q.count;
 }
 
-bool isStateQueueEmpty() {
-  return (queueCount == 0);
+bool isStateQueueEmpty(const StateQueue &q) {
+  return (q.count == 0);
 }
