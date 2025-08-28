@@ -1,7 +1,11 @@
 /****************************************************************
  * File Name: main.ino
  * Author:  Said Obaid, University of New Brunswick
- *          Alejandro Guarin, <Your Institution> (ORIGINAL CODE)     
+ *          <Said.Obaid@UNB.ca> 
+ *          (Current Maintainer)
+ *          Alejandro Guarin, National University of Colombia 
+ *          <aguarin@unal.edu.co> 
+ *          (Previous Maintainer; ORIGINAL CODE)                
  * Date: 21/07/2025
  * Description: General movement program via RFID Card input or 
  * manual serial input.
@@ -40,6 +44,31 @@
  *              - Added on-the-go serial motor pause/resume.
  * [02-08-2025] - Began process of integrating a queue system to
  *                facilitate trajectory/command planning.
+ * [##-08-2025] - Missed update logs but a lot happened in
+ *                August.
+ *              - Stepper drivers were adjusted using ST
+ *                configurator software for the X-Axis and 
+ *                header bridge of the G210 driver for Y-Axis.
+ *                X-Axis: 2000 Steps/Revolution
+ *                Y-Axis: 400  Steps/Revolution (Half Stepping)
+ *              - ActionQueue as a separate method of organized
+ *                commanding and for future integration with 
+ *                FMS central requests through serial. 
+ *                Commands only execute once the previous command 
+ *                is complete, and pistons/gripper commands apply 
+ *                a non-blocking delay (userAdjustable: 
+ *                delayActionLength) to avoid collision.
+ *              - Old non-queued commands remain and can be
+ *                called by including '/' before the command.
+ *                Main use is software motor pause or sensor
+ *                reset, testing really.
+ *              - Changed calibration routine to simultaneously
+ *                calibrate X and Y axes. It is faster that way.
+ * [27-08-2025] - Calibration sequence modified back to
+ *                blocking code for reliabilty.
+ * [2#-08-2025] - Began adding Alejandro's inventory management
+ *                code, mainly utlizing the camera. Logs
+ *                following are changes/additions I (Said) made.
  ****************************************************************
  * License: MIT License
  * 
@@ -96,11 +125,18 @@
 #define GRIPPER_PIN 32
 #define PISTON_PIN 40
 
-#define STEPS_PER_mm_VERTICAL   66.87584
-#define STEPS_PER_mm_HORIZONTAL -13.5451
+#define STEPS_PER_REVOLUTION_VERTICAL 400 // This is with the Gecko set to Half Stepping
+#define STEPS_PER_REVOLUTION_HORIZONTAL 2000 // This is with ST Configurator set to 2000 Step/Rev
+#define PULLEY_DIAMETER  47
+#define GEARBOX_REDUCTION 0.2 // 1:5 Gearbox
+
+
+#define STEPS_PER_mm_VERTICAL    STEPS_PER_REVOLUTION_VERTICAL/(PULLEY_DIAMETER*M_PI*GEARBOX_REDUCTION)
+#define STEPS_PER_mm_HORIZONTAL -STEPS_PER_REVOLUTION_HORIZONTAL/(PULLEY_DIAMETER*M_PI)
 
 #define VERTICALINCREMENT_mm    1.0
 #define HORIZONTALINCREMENT_mm  1.0
+#define STANDARDINCREMENT_mm 1.0
 
 
 
@@ -110,7 +146,6 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 AccelStepper horizontalStepper(1, MOTOR1_STEP, MOTOR1_DIR);
 AccelStepper verticalStepper(1, MOTOR2_STEP, MOTOR2_DIR);
 
-String msgQueued;
 
 unsigned long referenceMillis, currentMillis, delayTimer;
 unsigned long timeStep = 100, delayActionLength = 2000; //milliseconds
@@ -121,13 +156,13 @@ StateQueue actionQueue;
 StateCommand trajState, actionState, peekingState;
 
 
-float horizontalMaxSpeed = 1200,
-      horizontalAcceleration = 3000,
-      verticalMaxSpeed = 1200,
-      verticalAcceleration = horizontalAcceleration*5,
+float horizontalMaxSpeed = 1000,
+      horizontalAcceleration = 500,
+      verticalMaxSpeed = 1000,
+      verticalAcceleration = 1000,
       haltAcceleration = 1000,
       horizontalLimitTestSpeed = 1000,
-      verticalLimitTestSpeed = 2000;
+      verticalLimitTestSpeed = 500;
 
 long xLowerLimit = 0,
      xUpperLimit = 1520,
@@ -135,12 +170,14 @@ long xLowerLimit = 0,
      yUpperLimit = 900;
 
 
-long yPos = 0,
+float yPos = 0,
      xPos = 0,
      yPosTemp = 0,
      xPosTemp = 0,
      yPosCurrent = 0,
-     xPosCurrent = 0;
+     xPosCurrent = 0,
+     recentEnqueueYPos = 0,
+     recentEnqueueXPos = 0;
 
 long moveMultiplier = 0;
 
@@ -149,20 +186,17 @@ volatile bool isUpTriggered, isDownTriggered, isLeftTriggered, isRightTriggered 
 
 volatile bool isMoveComplete = false,
               isActionComplete = false,
+              verticalHalted = false,
+              horizontalHalted = false,
               motorsPaused = false,
               movementAllowed = false,
-              changeToZero = false,
               playingQueue = false,
               delayAction = false;
 
 bool piston1State = LOW, 
      gripper1State = LOW,
-     piston1CurrentState = LOW, 
-     gripper1CurrentState = LOW,
      piston2State = LOW, 
-     gripper2State = LOW,
-     piston2CurrentState = LOW, 
-     gripper2CurrentState = LOW;
+     gripper2State = LOW;
 
 
 
@@ -173,22 +207,30 @@ struct Shelf {
   int yPosition;
 };
 
-// Matriz de coordenadas del estante (columna, fila) en mm
-int coordinates[3][7][2] = {
-//     FILA 1      FILA 2       FILA 3       FILA 4      FILA 5        FILA 6        FILA 7
-    {{450,  10}, {450,  160},  {450,  280},  {450,  480},  {450,  640},  {450,  800},  {450,  960}},  // COLUMNA 1
-    {{850,  10}, {850,  160},  {850,  280},  {850,  480},  {850,  640},  {850,  800},  {850,  960}},  // COLUMNA 2
-    {{1300, 10}, {1300, 160},  {1300, 280},  {1300, 480},  {1300, 640},  {1300, 800},  {1300, 960}}  // COLUMNA 3
+// 3D array of shelfCoords for the storage cells (column, row) in millimeters
+int shelfCoords[5][7][2] = {
+//   ROW 1      ROW 2         ROW 3         ROW 4         ROW 5         ROW 6         ROW 7
+    {{415,  0}, {415,  140},  {415,  295},  {415,  445},  {415,  595},  {415,  745},  {415,  897}}, // COLUMN 1
+    {{595,  0}, {595,  140},  {595,  295},  {595,  445},  {595,  595},  {595,  745},  {595,  897}}, // COLUMN 2
+    {{815,  0}, {815,  140},  {815,  295},  {815,  445},  {815,  595},  {815,  745},  {815,  897}}, // COLUMN 3
+    {{995,  0}, {995,  140},  {995,  295},  {995,  445},  {995,  595},  {995,  745},  {995,  897}}, // COLUMN 4
+    {{1215, 0}, {1215, 140},  {1215, 295},  {1215, 445},  {1215, 595},  {1215, 745},  {1215, 897}}  // COLUMN 5
 };
 
+int bufferCoords[2][2][2] = {
+    {{215,460}, {395,460}},
+    {{0,460}, {50,460}}
+};
+
+
 Shelf shelves[] = {
-  {"82f059c", coordinates[1][4][0], coordinates[1][4][1]},
-  {"b3281128", coordinates[2][2][0], coordinates[2][2][1]},
-  {"5ed146c9", coordinates[0][4][0], coordinates[0][4][1]},
-  {"e27065c", coordinates[0][0][0], coordinates[0][0][1]},
-  {"535e4128", coordinates[0][6][0], coordinates[0][6][1]},
-  {"6c29dcb6", coordinates[2][0][0], coordinates[2][0][1]},
-  {"233fa113", coordinates[2][6][0], coordinates[2][6][1]},
+  {"82f059c", shelfCoords[1][4][0], shelfCoords[1][4][1]},
+  {"b3281128", shelfCoords[2][2][0], shelfCoords[2][2][1]},
+  {"5ed146c9", shelfCoords[0][4][0], shelfCoords[0][4][1]},
+  {"e27065c", shelfCoords[0][0][0], shelfCoords[0][0][1]},
+  {"535e4128", shelfCoords[0][6][0], shelfCoords[0][6][1]},
+  {"6c29dcb6", shelfCoords[2][0][0], shelfCoords[2][0][1]},
+  {"233fa113", shelfCoords[2][6][0], shelfCoords[2][6][1]},
 };
 
 void setup() {
@@ -234,21 +276,42 @@ void loop() {
 
   updateActions();
 
-  if (msgQueued.length() > 0) {
-    Serial.print(msgQueued);
-    msgQueued = "";
-  }
-
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim();
+    updateActions();
+    if (input.indexOf('>') > 0 || input.indexOf('<') > 0 ) {
+      int bufferCommaIndex = input.indexOf(',');
+      
+      // (sideSelect,bufferIdx)
+      int sideSelect = input.substring(1, bufferCommaIndex).toInt();
+      int bufferParenIndex = input.indexOf(')');
+      int bufferIdx = input.substring(bufferCommaIndex + 1, bufferParenIndex).toInt();
 
-    // Procesar comandos de movimiento en milímetros
-    if (input.indexOf(',') > 0) {
+      int stackParen1Index = input.indexOf('(',bufferParenIndex+1);
+      int stackParen2Index = input.indexOf(')',bufferParenIndex+1);
+      int stackCommaIndex = input.indexOf(',',bufferParenIndex);
+
+      int stackROWIdx = input.substring(stackParen1Index+1, stackCommaIndex).toInt();
+      int stackCOLIdx = input.substring(stackCommaIndex+1, stackParen2Index).toInt();
+
+      if (input.indexOf('>') > 0) {
+        Serial.println("Side: " + String(sideSelect) + " | [Buffer: " + String(bufferIdx) + "] > [Stack: ROW:"+  String(stackROWIdx) + ", COL:" + String(stackCOLIdx) + "]");
+        //putAway(sideSelect,bufferIdx,stackROWIdx,stackCOLIdx);
+      }
+      else {
+        Serial.println("Side: " + String(sideSelect) + " | [Stack: ROW:" + String(stackROWIdx) + ", COL:" + String(stackCOLIdx) + "] > [Buffer: " + String(bufferIdx) + "]");
+        retrieve(sideSelect,bufferIdx,stackROWIdx,stackCOLIdx);
+      }
+
+
+    }
+    updateActions();
+    if (input.indexOf(',') > 0 && (input.indexOf('(') == -1)) {
       char delimiter = ',';
       int commaIndex = input.indexOf(delimiter);
 
-      if (commaIndex > 0) {
+      if (commaIndex > 0) { 
         float distanceHorizontal = input.substring(0, commaIndex).toFloat(); // Distancia para el motor vertical
         float distanceVertical = input.substring(commaIndex + 1).toFloat(); // Distancia para el motor horizontal
 
@@ -276,49 +339,33 @@ void loop() {
           case 'F': operateGripperAndPiston(2); break;
           case 'Q': enqueueTrajectory(); break;
           case 'R': sensorReset(); break;
-          default : Serial.println("Unknown Command"); break;
+          default : Serial.println("Unknown Direct '/' Command"); break;
         } 
-
+        recentEnqueueXPos = xPosCurrent;
+        recentEnqueueYPos = yPosCurrent;
       }
       else {
         moveMultiplier = parseCommandValue(input);
         switch (toupper(command)) {
-          case 'P': piston1CurrentState = piston1State;
-                    piston1State = !piston1State;
-                    enqueueAction(xPosCurrent, yPosCurrent,
-                                  gripper1State, piston1State, gripper2State, piston2State);
+          case 'P': enqueueActuator(moveMultiplier, true, false);
+                    break;
+          case 'G': enqueueActuator(moveMultiplier, false, true);
+                    break;
+          case 'X': recentEnqueueXPos = xPosCurrent + HORIZONTALINCREMENT_mm * moveMultiplier;
+                    recentEnqueueYPos = yPosCurrent;
+                    enqueueAction(recentEnqueueXPos, recentEnqueueYPos,
+                                  LOW,LOW,LOW,LOW);
                                   break;
-          case 'G': gripper1State = !gripper1State;
-                    enqueueAction(xPosCurrent, yPosCurrent,
-                                  gripper1State, piston1State, gripper2State, piston2State);
+          case 'Y': recentEnqueueXPos = xPosCurrent;
+                    recentEnqueueYPos = yPosCurrent + VERTICALINCREMENT_mm * moveMultiplier;
+                    enqueueAction(recentEnqueueXPos, recentEnqueueYPos,
+                                  LOW,LOW,LOW,LOW);
                                   break;
-          case 'D': enqueueAction(xPosCurrent - HORIZONTALINCREMENT_mm * moveMultiplier,
-                                  yPosCurrent, gripper1State, piston1State,
-                                  gripper2State, piston2State);
-                                  break;
-          case 'A': enqueueAction(xPosCurrent + HORIZONTALINCREMENT_mm * moveMultiplier,
-                                  yPosCurrent, gripper1State, piston1State,
-                                  gripper2State, piston2State);
-                                  break;
-          case 'S': enqueueAction(xPosCurrent, yPosCurrent - VERTICALINCREMENT_mm * moveMultiplier,
-                                  gripper1State, piston1State,
-                                  gripper2State, piston2State);
-                                  break;
-          case 'W': piston1CurrentState = piston1State;
-                    enqueueAction(xPosCurrent, yPosCurrent + VERTICALINCREMENT_mm * moveMultiplier,
-                                  gripper1State, piston1State,
-                                  gripper2State, piston2State);
-                                  break;
-          case 'B': pauseMotors(); break;
           case 'H': calibrateLimits(); break;
-          case 'O': goToOrigin(); break;
-          case 'T': operateGripperAndPiston(1); break;
-          case 'F': operateGripperAndPiston(2); break;
-          case 'Q': enqueueTrajectory(); break;
-          case 'R': sensorReset(); break;
           default : Serial.println("Unknown Command"); break;
         }
       }
+      updateActions();
       
     }
       
@@ -344,18 +391,18 @@ void loop() {
     rfid.PICC_HaltA();
   }
 
-  if (isUpTriggered || isDownTriggered){
+  if ((isUpTriggered || isDownTriggered) && !verticalHalted){
     yPosCurrent = haltVertical(haltAcceleration);
     verticalStepper.setCurrentPosition(yPosCurrent*STEPS_PER_mm_VERTICAL);
   }
-  if (isRightTriggered || isLeftTriggered){
+  if ((isRightTriggered || isLeftTriggered) && !horizontalHalted){
     xPosCurrent = haltHorizontal(haltAcceleration);
     horizontalStepper.setCurrentPosition(xPosCurrent*STEPS_PER_mm_HORIZONTAL);
   }
   
 }
 
-void moveJ(long xPos, long yPos) {
+void moveJ(float xPos, float yPos) {
   isMoveComplete = false;
   
   xPos = constrain(xPos, xLowerLimit, xUpperLimit);
@@ -400,14 +447,19 @@ void updateActions(){
     delayAction = false;
   }
 
-  if ((stateQueueSize(actionQueue) != 0 ) && (!delayAction && isDistanceToPosZero())){
+  if ((stateQueueSize(actionQueue) != 0 ) && (!delayAction && isDistanceToPosZero()) && !allSensors()){
     if (isDistanceToPosZero()){ // I FIX THIS YESTERDAY
       dequeueState(actionQueue, actionState);
       Serial.println("Dequeued Action");
       moveJ(actionState.xCoord, actionState.yCoord);
-      if (actionState.gripper1State != gripper1CurrentState || actionState.piston1State != piston1CurrentState){
-        digitalWrite(GRIPPER_PIN, actionState.gripper1State);
-        digitalWrite(PISTON_PIN, actionState.piston1State);
+      if (actionState.piston1State == HIGH || actionState.gripper1State == HIGH){
+        if (actionState.gripper1State == HIGH){
+          digitalWrite(GRIPPER_PIN, gripper1State = !gripper1State);
+        }
+        if (actionState.piston1State == HIGH ){
+          digitalWrite(PISTON_PIN, piston1State = !piston1State);
+        }
+        delayAction = true;
         delayTimer = millis();
       }
     }
@@ -453,14 +505,6 @@ void updateActions(){
       }
     }
 
-    if (changeToZero && !movementAllowed) {
-      verticalStepper.setCurrentPosition(0);
-      yPosCurrent = 0;
-      horizontalStepper.setCurrentPosition(0);
-      xPosCurrent = 0;
-      changeToZero = false;
-    }
-
     if (!motorsPaused && isDistanceToPosZero()){
       Serial.println("Move Complete");
       stateCurrentPosition();
@@ -504,13 +548,17 @@ void calibrateLimits(){
   
   verticalStepper.setCurrentPosition(0);
   horizontalStepper.setCurrentPosition(0);
+  verticalStepper.moveTo(5 * STEPS_PER_mm_VERTICAL);
+  horizontalStepper.moveTo(5 * STEPS_PER_mm_HORIZONTAL);
+  while (!isDistanceToPosZero()) {
+    verticalStepper.run();
+    horizontalStepper.run();
+  }
+  verticalStepper.setCurrentPosition(0);
+  horizontalStepper.setCurrentPosition(0);
+  positionReset();
   sensorReset();
-
-  delay(1000);
-  moveJ(5,5);
-  changeToZero = true;
-  
-  msgQueued = "CALIBRATION COMPLETE\n";
+  Serial.println("CALIBRATION COMPLETE");
 }
 
 void operateGripperAndPiston(int action){
@@ -560,12 +608,57 @@ void enqueueTrajectory(){
 void enqueueAction(long xPosCMD, long yPosCMD, bool gripper1CMD, bool piston1CMD, bool gripper2CMD, bool piston2CMD){
   xPosCMD = constrain(xPosCMD, xLowerLimit, xUpperLimit);
   yPosCMD = constrain(yPosCMD, yLowerLimit, yUpperLimit);
-  Serial.println(String(piston1CMD));
   enqueueState(actionQueue, -1, xPosCMD, yPosCMD, -1, -1,
               gripper1CMD, piston1CMD, gripper2CMD, piston2CMD);
   Serial.println("Enqueued Postion: X: " + String(xPosCMD) + ", Y: " + String(yPosCMD));
 }
 
+void enqueueActuator(int sideSelect, bool togglePiston, bool toggleGripper){
+  bool toggleP1 = LOW;
+  bool toggleP2 = LOW;
+  bool toggleG1 = LOW;
+  bool toggleG2 = LOW;
+  
+  if (togglePiston == true){
+    if (sideSelect == 0) {
+      toggleP1 = HIGH;
+    }
+    else{
+      toggleP2 = HIGH;
+    }
+  }
+
+  if (toggleGripper == true){
+    if (sideSelect == 0) {
+      toggleG1 = HIGH;
+    }
+    else{
+      toggleG2 = HIGH;
+    }
+  }
+  enqueueAction(recentEnqueueXPos, recentEnqueueYPos,
+                toggleG1, toggleP1, toggleG2, toggleP2);
+}
+
+void retrieve(int sideSelect, long bufferIdx, long stackROWIdx, long stackCOLIdx){
+  actuatorReset();
+  recentEnqueueXPos = shelfCoords[stackCOLIdx][stackROWIdx][0];
+  recentEnqueueYPos = shelfCoords[stackCOLIdx][stackROWIdx][1];
+  enqueueAction(recentEnqueueXPos,
+                recentEnqueueYPos,
+                LOW,LOW,LOW,LOW);
+  enqueueActuator(sideSelect,true,false);
+  enqueueActuator(sideSelect,false,true);
+  enqueueActuator(sideSelect,true,false);
+  recentEnqueueXPos = bufferCoords[sideSelect][bufferIdx][0];
+  recentEnqueueYPos = bufferCoords[sideSelect][bufferIdx][1];
+  enqueueAction(recentEnqueueXPos,
+                recentEnqueueYPos,
+                LOW,LOW,LOW,LOW);
+  enqueueActuator(sideSelect,true,false);
+  enqueueActuator(sideSelect,false,true);
+  enqueueActuator(sideSelect,true,false);
+}
 
 void blinkingLed() {
   static bool ledState = LOW; // Estado del LED (LOW = apagado, HIGH = encendido)
@@ -577,28 +670,51 @@ void sensorUp_ISR()     { Serial.println("UP SENSOR PROXIMITY ACTIVATED"); isUpT
 void sensorDown_ISR()   { Serial.println("DOWN SENSOR PROXIMITY ACTIVATED"); isDownTriggered = true; }
 void sensorLeft_ISR()   { Serial.println("LEFT SENSOR PROXIMITY ACTIVATED"); isLeftTriggered = true; }
 void sensorRight_ISR()  { Serial.println("RIGHT SENSOR PROXIMITY ACTIVATED"); isRightTriggered = true; }
-void sensorReset()      { isUpTriggered = isDownTriggered = isLeftTriggered = isRightTriggered = false; }
+bool allSensors()       { return isUpTriggered && isDownTriggered && isLeftTriggered && isRightTriggered;}
+void sensorReset()      { isUpTriggered = isDownTriggered = isLeftTriggered = isRightTriggered = verticalHalted = horizontalHalted = false; }
 
-long haltHorizontal(float haltAcceleration){
+float haltHorizontal(float haltAcceleration){
   horizontalStepper.setAcceleration(haltAcceleration);
   horizontalStepper.stop();
   horizontalStepper.setAcceleration(horizontalAcceleration);
-  xPosCurrent = horizontalStepper.currentPosition()/STEPS_PER_mm_HORIZONTAL;
-  return xPosCurrent;
+  horizontalHalted = true;
+  return ((float)horizontalStepper.currentPosition())/((float)STEPS_PER_mm_HORIZONTAL);
 }
-long haltVertical(float haltAcceleration){
+
+float haltVertical(float haltAcceleration){
   verticalStepper.setAcceleration(haltAcceleration);
   verticalStepper.stop();
   verticalStepper.setAcceleration(verticalAcceleration);
-  yPosCurrent = verticalStepper.currentPosition()/STEPS_PER_mm_VERTICAL;
-  return yPosCurrent;
+  verticalHalted = true;
+  
+  return ((float)verticalStepper.currentPosition())/((float)STEPS_PER_mm_VERTICAL);
 }
 
 void stateCurrentPosition(){
   Serial.println("X: " + String(xPosCurrent) + ", Y: " + String(yPosCurrent));
 }
 
-long parseCommandValue(const String& input) {
+void positionReset() {
+  yPos              = 0;
+  xPos              = 0;
+  yPosTemp          = 0;
+  xPosTemp          = 0;
+  yPosCurrent       = 0;
+  xPosCurrent       = 0;
+  recentEnqueueYPos = 0;
+  recentEnqueueXPos = 0;
+}
+
+void actuatorReset() {
+  piston1State  = LOW; 
+  gripper1State = LOW;
+  piston2State  = LOW; 
+  gripper2State = LOW;
+  digitalWrite(PISTON_PIN, piston1State);
+  digitalWrite(GRIPPER_PIN, gripper1State);
+}
+
+long parseCommandValue(const String& input){
   return (input.length() <= 1) ? 1 : input.substring(1).toFloat();
 }
 
