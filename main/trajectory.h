@@ -2,7 +2,7 @@
  * File Name: trajectory.h
  * Author:  Said Obaid, University of New Brunswick
  * Date: 18/08/2025
- * Description: -
+ * Description: INCOMPLETE - HAS BUGS
  ****************************************************************
  * Modification History:
  * [18-08-2025] - Original File Developed by Said Obaid.
@@ -29,7 +29,7 @@ struct TrajectoryPoint {
   bool    piston2State;         
 };
 
-extern const TrajectoryPoint trajectoryData[][8];
+extern const TrajectoryPoint trajectoryData[][9];
 extern const long trajectoryLen;
 
 #endif

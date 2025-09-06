@@ -66,6 +66,9 @@
  *                calibrate X and Y axes. It is faster that way.
  * [27-08-2025] - Calibration sequence modified back to
  *                blocking code for reliabilty.
+ * [28-08-2025] - Remade shelving Coordinates to be an actual
+ *                3-Dimensionally index positions, 
+ *                [Side][Col][Row][X/Y].
  * [2#-08-2025] - Began adding Alejandro's inventory management
  *                code, mainly utlizing the camera. Logs
  *                following are changes/additions I (Said) made.
@@ -106,7 +109,7 @@
 
 #define LED_PIN 13
 
-#define SS_PIN 43
+#define SS_PIN 43 // Right: Near=43 Far=53
 #define RST_PIN 44
 
 #define PROX_SENSOR_UP 19 // Right and Up pin numbers switch around 
@@ -125,13 +128,14 @@
 #define GRIPPER_PIN 32
 #define PISTON_PIN 40
 
-#define STEPS_PER_REVOLUTION_VERTICAL 400 // This is with the Gecko set to Half Stepping
-#define STEPS_PER_REVOLUTION_HORIZONTAL 2000 // This is with ST Configurator set to 2000 Step/Rev
-#define PULLEY_DIAMETER  47
+#define STEPS_PER_REVOLUTION_VERTICAL 400.0// This is with the Gecko set to Half Stepping
+#define STEPS_PER_REVOLUTION_HORIZONTAL 2000.0 // This is with ST Configurator set to 2000 Step/Rev
+#define PULLEY_DIAMETER  47.0
 #define GEARBOX_REDUCTION 0.2 // 1:5 Gearbox
 
 
 #define STEPS_PER_mm_VERTICAL    STEPS_PER_REVOLUTION_VERTICAL/(PULLEY_DIAMETER*M_PI*GEARBOX_REDUCTION)
+
 #define STEPS_PER_mm_HORIZONTAL -STEPS_PER_REVOLUTION_HORIZONTAL/(PULLEY_DIAMETER*M_PI)
 
 #define VERTICALINCREMENT_mm    1.0
@@ -167,17 +171,16 @@ float horizontalMaxSpeed = 1000,
 long xLowerLimit = 0,
      xUpperLimit = 1520,
      yLowerLimit = 0,
-     yUpperLimit = 900;
+     yUpperLimit = 900,
+     RFIDPlateLift_mm = 30,
+     ShelfLift_mm = 20,
+     ShelfDrop_mm = 0;
 
 
-float yPos = 0,
-     xPos = 0,
-     yPosTemp = 0,
-     xPosTemp = 0,
-     yPosCurrent = 0,
-     xPosCurrent = 0,
-     recentEnqueueYPos = 0,
-     recentEnqueueXPos = 0;
+float yPosCurrent = 0,
+      xPosCurrent = 0,
+      recentEnqueueYPos = 0,
+      recentEnqueueXPos = 0;
 
 long moveMultiplier = 0;
 
@@ -208,18 +211,33 @@ struct Shelf {
 };
 
 // 3D array of shelfCoords for the storage cells (column, row) in millimeters
-int shelfCoords[5][7][2] = {
-//   ROW 1      ROW 2         ROW 3         ROW 4         ROW 5         ROW 6         ROW 7
-    {{415,  0}, {415,  140},  {415,  295},  {415,  445},  {415,  595},  {415,  745},  {415,  897}}, // COLUMN 1
-    {{595,  0}, {595,  140},  {595,  295},  {595,  445},  {595,  595},  {595,  745},  {595,  897}}, // COLUMN 2
-    {{815,  0}, {815,  140},  {815,  295},  {815,  445},  {815,  595},  {815,  745},  {815,  897}}, // COLUMN 3
-    {{995,  0}, {995,  140},  {995,  295},  {995,  445},  {995,  595},  {995,  745},  {995,  897}}, // COLUMN 4
-    {{1215, 0}, {1215, 140},  {1215, 295},  {1215, 445},  {1215, 595},  {1215, 745},  {1215, 897}}  // COLUMN 5
+int shelfCoords[2][7][3][2] = { //[Side][Row][Col][X/Y]
+  // Right Side [0]
+  // Col [0]   Col [1]    Col [2]
+  {
+    {{800,0},  {1200,0},  {1520,0}},   // Row [0]
+    {{800,127},{1200,127},{1520,127}}, // Row [1]
+    {{800,282},{1200,282},{1520,282}}, // Row [2]
+    {{800,433},{1200,433},{1520,433}}, // Row [3]
+    {{800,583},{1200,583},{1520,583}}, // Row [4]
+    {{800,735},{1200,735},{1520,735}}, // Row [5]
+    {{800,887},{1200,887},{1520,887}}, // Row [6]
+  },
+  // Left Side [1]
+  { 
+    {{525,0},  {920,0},  {1320,0}},
+    {{525,140},{920,140},{1320,140}},
+    {{525,295},{920,295},{1320,295}},
+    {{525,445},{920,445},{1320,445}},
+    {{525,595},{920,595},{1320,595}},
+    {{525,745},{920,745},{1320,745}},
+    {{525,890},{920,890},{1320,890}},
+  }
 };
 
 int bufferCoords[2][2][2] = {
-    {{215,460}, {395,460}},
-    {{0,460}, {50,460}}
+    {{280,450}, {460,450}},
+    {{5,460}, {185,460}}
 };
 
 
@@ -234,7 +252,7 @@ Shelf shelves[] = {
 };
 
 void setup() {
-
+  
   pinMode(LED_PIN, OUTPUT); 
   Timer1.initialize(500000);  // 150 ms
   Timer1.attachInterrupt(blinkingLed);
@@ -297,7 +315,7 @@ void loop() {
 
       if (input.indexOf('>') > 0) {
         Serial.println("Side: " + String(sideSelect) + " | [Buffer: " + String(bufferIdx) + "] > [Stack: ROW:"+  String(stackROWIdx) + ", COL:" + String(stackCOLIdx) + "]");
-        //putAway(sideSelect,bufferIdx,stackROWIdx,stackCOLIdx);
+        putAway(sideSelect,bufferIdx,stackROWIdx,stackCOLIdx);
       }
       else {
         Serial.println("Side: " + String(sideSelect) + " | [Stack: ROW:" + String(stackROWIdx) + ", COL:" + String(stackCOLIdx) + "] > [Buffer: " + String(bufferIdx) + "]");
@@ -412,12 +430,14 @@ void moveJ(float xPos, float yPos) {
   if (!(isRightTriggered || isLeftTriggered)){
     horizontalStepper.moveTo(xPos * STEPS_PER_mm_HORIZONTAL);
     xPosCurrent = xPos;
+    recentEnqueueXPos = xPosCurrent;
   }
   else{Serial.println("A Horizontal Sensor Was Triggered");}
 
   if (!(isUpTriggered || isDownTriggered)){
     verticalStepper.moveTo(yPos * STEPS_PER_mm_VERTICAL);
     yPosCurrent = yPos;
+    recentEnqueueYPos = yPosCurrent;
   }
   else{Serial.println("A Vertical Sensors Was Triggered");}
 
@@ -428,8 +448,8 @@ void pauseMotors(){
 
   if (motorsPaused) {
     Serial.println("Motors PAUSED");
-    xPosTemp = xPosCurrent;
-    yPosTemp = yPosCurrent;
+    long xPosTemp = xPosCurrent;
+    long yPosTemp = yPosCurrent;
     xPosCurrent = haltHorizontal(haltAcceleration);
     yPosCurrent = haltVertical(haltAcceleration);
     stateCurrentPosition();
@@ -534,6 +554,7 @@ void syncHorizontalStepperToState(){
 
 void calibrateLimits(){
   Serial.println("CALIBRATION IN PROGRESS");
+  actuatorReset();
   while (!isDownTriggered || !isLeftTriggered) {
     if(!isDownTriggered){
       verticalStepper.setSpeed(-verticalLimitTestSpeed);
@@ -640,22 +661,50 @@ void enqueueActuator(int sideSelect, bool togglePiston, bool toggleGripper){
                 toggleG1, toggleP1, toggleG2, toggleP2);
 }
 
-void retrieve(int sideSelect, long bufferIdx, long stackROWIdx, long stackCOLIdx){
+void retrieve(int sideSelect, long bufferIdx, long stackROWIdx, long stackCOLIdx) {
   actuatorReset();
-  recentEnqueueXPos = shelfCoords[stackCOLIdx][stackROWIdx][0];
-  recentEnqueueYPos = shelfCoords[stackCOLIdx][stackROWIdx][1];
-  enqueueAction(recentEnqueueXPos,
-                recentEnqueueYPos,
+  enqueueAction(recentEnqueueXPos = shelfCoords[sideSelect][stackROWIdx][stackCOLIdx][0],
+                recentEnqueueYPos = shelfCoords[sideSelect][stackROWIdx][stackCOLIdx][1],
                 LOW,LOW,LOW,LOW);
   enqueueActuator(sideSelect,true,false);
   enqueueActuator(sideSelect,false,true);
-  enqueueActuator(sideSelect,true,false);
-  recentEnqueueXPos = bufferCoords[sideSelect][bufferIdx][0];
-  recentEnqueueYPos = bufferCoords[sideSelect][bufferIdx][1];
-  enqueueAction(recentEnqueueXPos,
-                recentEnqueueYPos,
+  enqueueAction(recentEnqueueXPos = recentEnqueueXPos,
+                recentEnqueueYPos = recentEnqueueYPos + ShelfLift_mm,
                 LOW,LOW,LOW,LOW);
   enqueueActuator(sideSelect,true,false);
+
+  enqueueAction(recentEnqueueXPos = bufferCoords[sideSelect][bufferIdx][0],
+                recentEnqueueYPos = bufferCoords[sideSelect][bufferIdx][1] + RFIDPlateLift_mm,
+                LOW,LOW,LOW,LOW);
+  enqueueActuator(sideSelect,true,false);
+  enqueueAction(recentEnqueueXPos = recentEnqueueXPos,
+                recentEnqueueYPos = recentEnqueueYPos - RFIDPlateLift_mm,
+                LOW,LOW,LOW,LOW);
+  enqueueActuator(sideSelect,false,true);
+  enqueueActuator(sideSelect,true,false);
+}
+
+void putAway(int sideSelect, long bufferIdx, long stackROWIdx, long stackCOLIdx) {
+  actuatorReset();
+  recentEnqueueXPos = bufferCoords[sideSelect][bufferIdx][0];
+  recentEnqueueYPos = bufferCoords[sideSelect][bufferIdx][1];
+  enqueueAction(recentEnqueueXPos = bufferCoords[sideSelect][bufferIdx][0],
+                recentEnqueueYPos = bufferCoords[sideSelect][bufferIdx][1],
+                LOW,LOW,LOW,LOW);
+  enqueueActuator(sideSelect,true,false);
+  enqueueActuator(sideSelect,false,true);
+  enqueueAction(recentEnqueueXPos = recentEnqueueXPos,
+                recentEnqueueYPos = recentEnqueueYPos + RFIDPlateLift_mm,
+                LOW,LOW,LOW,LOW);
+  enqueueActuator(sideSelect,true,false);
+
+  enqueueAction(recentEnqueueXPos = shelfCoords[sideSelect][stackROWIdx][stackCOLIdx][0],
+                recentEnqueueYPos = shelfCoords[sideSelect][stackROWIdx][stackCOLIdx][1]+ShelfLift_mm,
+                LOW,LOW,LOW,LOW);
+  enqueueActuator(sideSelect,true,false);
+  enqueueAction(recentEnqueueXPos = recentEnqueueXPos,
+                recentEnqueueYPos = recentEnqueueYPos-ShelfLift_mm,
+                LOW,LOW,LOW,LOW);
   enqueueActuator(sideSelect,false,true);
   enqueueActuator(sideSelect,true,false);
 }
@@ -695,10 +744,6 @@ void stateCurrentPosition(){
 }
 
 void positionReset() {
-  yPos              = 0;
-  xPos              = 0;
-  yPosTemp          = 0;
-  xPosTemp          = 0;
   yPosCurrent       = 0;
   xPosCurrent       = 0;
   recentEnqueueYPos = 0;
